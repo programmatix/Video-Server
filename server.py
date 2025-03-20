@@ -212,6 +212,45 @@ def list_audio():
         logger.error(f"Error listing audio: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
+@app.route('/api/audio2', methods=['GET'])
+def list_audio_detailed():
+    try:
+        start_time = datetime.now()
+        
+        # Process date parameters
+        start_date, end_date = process_date_params(request)
+        
+        logger.info(f"Listing detailed audio with start={start_date}, end={end_date}")
+        
+        media_files = media_index.get_files(directory="audio", start=start_date, end=end_date)
+        audio_files = [f for f in media_files if f.endswith(('.mp3', '.opus', '.ogg', '.wav'))]
+        
+        result = []
+        for filename in audio_files:
+            file_path = os.path.join(AUDIO_MEDIA_DIR, filename)
+            file_size = os.path.getsize(file_path) if os.path.exists(file_path) else 0
+            
+            # Create result object
+            audio_info = {
+                "filename": filename,
+                "file_size_in_bytes": file_size,
+                "duration_ms": 30000  # Fixed duration of 30 seconds (30000 ms)
+            }
+            
+            # Extract timestamp from filename
+            epoch_millis = extract_timestamp_from_filename(filename)
+            if epoch_millis:
+                audio_info["filename_as_epoch_millis"] = epoch_millis
+                
+            result.append(audio_info)
+
+        duration = datetime.now() - start_time
+        logger.info(f"Returning {len(result)} detailed audio files. Duration: {duration.total_seconds():.2f}s")
+        return jsonify(result)
+    except Exception as e:
+        logger.error(f"Error listing detailed audio: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
 # REST API to stream a media file (returns raw data)
 @app.route('/media/<filename>', methods=['GET'])
 def get_media(filename):
