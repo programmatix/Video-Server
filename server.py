@@ -1,7 +1,7 @@
 from flask import Flask, jsonify, send_from_directory, abort, Response, render_template, request
 from flask_cors import CORS
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 import pandas as pd
 import logging
 from functools import lru_cache
@@ -9,6 +9,7 @@ import time
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 import threading
+import re
 from file_cache import MediaFileIndex
 from file_cache import FileChangeHandler
 app = Flask(__name__)
@@ -24,84 +25,6 @@ logger = logging.getLogger(__name__)
 MEDIA_DIR = "/home/graham/motion"
 AUDIO_MEDIA_DIR = "/home/graham/audio"
 
-# def parse_media_date(filename, is_video=False, is_audio=False):
-#     try:
-#         if is_video:
-#             # movie_filename %Y%m%d_%H%M%S
-#             # 20250212_064159.mkv
-#             date_str = filename[:15].replace('_', '')
-#         elif is_audio:
-#             # recording_20241209_064622.opus
-#             date_str = filename[10:25].replace('_', '')
-#         else:
-#             # 57-20250212071300-snapshot.jpg  
-#             # picture_filename %Y%m%d_%H%M%S-%q
-#             date_str = filename.split('-')[1][:14]
-#         return datetime.strptime(date_str, '%Y%m%d%H%M%S').astimezone()
-#     except (IndexError, ValueError):
-#         return None
-
-# class MediaFileIndex:
-#     def __init__(self):
-#         self.files = {}  # filename -> (datetime, type)
-#         self.lock = threading.Lock()
-
-#     def update_file(self, filename, directory):
-#         if not filename.endswith(('.mp4', '.mkv', '.avi', '.mp3', '.jpg', '.png', '.jpeg', '.opus', '.ogg', '.wav')):
-#             return
-            
-#         is_video = filename.endswith(('.mp4', '.mkv', '.avi'))
-#         is_audio = filename.endswith(('.mp3', '.opus', '.ogg', '.wav'))
-#         date = parse_media_date(filename, is_video=is_video, is_audio=is_audio)
-        
-#         if date:
-#             with self.lock:
-#                 self.files[filename] = (date, directory)
-#                 logger.info(f"Added/updated file in index: {filename} with date {date}")
-
-#     def remove_file(self, filename):
-#         with self.lock:
-#             if filename in self.files:
-#                 del self.files[filename]
-#                 logger.info(f"Removed file from index: {filename}")
-
-#     def build_index(self, media_dir, audio_dir):
-#         start_time = datetime.now()
-#         logger.info("Starting to build media file index...")
-        
-#         with self.lock:
-#             self.files.clear()
-            
-#             for directory, dir_path in [("media", media_dir), ("audio", audio_dir)]:
-#                 file_count = 0
-#                 logger.info(f"Scanning {directory} directory: {dir_path}")
-                
-#                 for entry in os.scandir(dir_path):
-#                     self.update_file(entry.name, directory)
-#                     file_count += 1
-#                     if file_count % 1000 == 0:
-#                         logger.info(f"Processed {file_count} files in {directory} directory...")
-                        
-#                 logger.info(f"Completed scanning {directory} directory. Processed {file_count} files.")
-
-#         duration = datetime.now() - start_time
-#         logger.info(f"Finished building index in {duration.total_seconds():.2f}s. Total files indexed: {len(self.files)}")
-
-#     def get_files(self, directory=None, start=None, end=None):
-#         with self.lock:
-#             files = []
-#             for filename, (date, file_dir) in self.files.items():
-#                 if directory and file_dir != directory:
-#                     continue
-                    
-#                 if start and date < start:
-#                     continue
-#                 if end and date > end:
-#                     continue
-                    
-#                 files.append(filename)
-#             return files
-
 
 # Initialize index and build it
 media_index = MediaFileIndex()
@@ -115,17 +38,84 @@ observer.schedule(media_handler, MEDIA_DIR, recursive=False)
 observer.schedule(audio_handler, AUDIO_MEDIA_DIR, recursive=False)
 observer.start()
 
+# Set up a background task to periodically scan for new JSON metadata
+def metadata_scanner_task():
+    while True:
+        try:
+            # Sleep first to give time for the server to start up
+            time.sleep(300)  # Check every 5 minutes
+            logger.info("Running periodic scan for new JSON metadata files")
+            media_index.scan_for_missing_metadata()
+        except Exception as e:
+            logger.error(f"Error in metadata scanner task: {str(e)}")
+
+# Start the metadata scanner in a separate thread
+metadata_scanner_thread = threading.Thread(target=metadata_scanner_task, daemon=True)
+metadata_scanner_thread.start()
+
+def extract_timestamp_from_filename(filename):
+    timestamp_match = re.match(r'(\d{4})(\d{2})(\d{2})_?(\d{2})(\d{2})(\d{2})', filename)
+    if timestamp_match:
+        year, month, day, hour, minute, second = map(int, timestamp_match.groups())
+        try:
+            dt = datetime(year, month, day, hour, minute, second)
+            return int(dt.timestamp() * 1000)  # Convert to milliseconds
+        except ValueError:
+            logger.error(f"Invalid date components in filename: {filename}")
+    return None
+
+def process_date_params(request):
+    """Process date parameters, handling both start/end and day parameters"""
+    start = request.args.get('start')
+    end = request.args.get('end')
+    day = request.args.get('day')
+    
+    # If day parameter is provided, it overrides start and end
+    if day:
+        try:
+            # Create datetime at noon of specified day
+            base_date = datetime.fromisoformat(day)
+            # Ensure the datetime is naive (no timezone info)
+            if base_date.tzinfo is not None:
+                base_date = base_date.replace(tzinfo=None)
+                
+            start_date = datetime(base_date.year, base_date.month, base_date.day, 12, 0, 0)
+            # Set end date to noon of next day
+            end_date = start_date + timedelta(days=1)
+            
+            logger.info(f"Using day parameter: {day}, start={start_date.isoformat()}, end={end_date.isoformat()}")
+            return start_date, end_date
+        except ValueError as e:
+            logger.error(f"Invalid day format: {day}, error: {str(e)}")
+    
+    # Process regular start/end parameters
+    start_date = None
+    end_date = None
+    
+    if start:
+        start_date = datetime.fromisoformat(start)
+        # Ensure the datetime is naive (no timezone info)
+        if start_date.tzinfo is not None:
+            start_date = start_date.replace(tzinfo=None)
+            
+    if end:
+        end_date = datetime.fromisoformat(end)
+        # Ensure the datetime is naive (no timezone info)
+        if end_date.tzinfo is not None:
+            end_date = end_date.replace(tzinfo=None)
+    
+    return start_date, end_date
+
 # Update API endpoints to use index
 @app.route('/api/files', methods=['GET'])
 def list_files():
     try:
         start_time = datetime.now()
-        start = request.args.get('start')
-        end = request.args.get('end')
-        logger.info(f"Listing files with start={start}, end={end}")
         
-        start_date = datetime.fromisoformat(start) if start else None
-        end_date = datetime.fromisoformat(end) if end else None
+        # Process date parameters
+        start_date, end_date = process_date_params(request)
+        
+        logger.info(f"Listing files with start={start_date}, end={end_date}")
         
         media_files = media_index.get_files(directory="media", start=start_date, end=end_date)
         media_files = [f for f in media_files if f.endswith(('.mp4', '.mkv', '.avi', '.mp3'))]
@@ -137,16 +127,60 @@ def list_files():
         logger.error(f"Error listing files: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
+@app.route('/api/videos', methods=['GET'])
+def list_videos():
+    try:
+        start_time = datetime.now()
+        
+        # Process date parameters
+        start_date, end_date = process_date_params(request)
+        
+        logger.info(f"Listing videos with start={start_date}, end={end_date}")
+        
+        media_files = media_index.get_files(directory="media", start=start_date, end=end_date)
+        video_files = [f for f in media_files if f.endswith(('.mp4', '.mkv', '.avi'))]
+        
+        result = []
+        for filename in video_files:
+            file_path = os.path.join(MEDIA_DIR, filename)
+            file_size = os.path.getsize(file_path) if os.path.exists(file_path) else 0
+            
+            # Get metadata if available
+            metadata = media_index.get_video_details(filename)
+            
+            # Create result object
+            video_info = {
+                "filename": filename,
+                "file_size_in_bytes": file_size
+            }
+            
+            # Extract timestamp from filename
+            epoch_millis = extract_timestamp_from_filename(filename)
+            if epoch_millis:
+                video_info["filename_as_epoch_millis"] = epoch_millis
+            
+            # Add metadata if available
+            if metadata:
+                video_info.update(metadata)
+                
+            result.append(video_info)
+
+        duration = datetime.now() - start_time
+        logger.info(f"Returning {len(result)} video details. Duration: {duration.total_seconds():.2f}s")
+        return jsonify(result)
+    except Exception as e:
+        logger.error(f"Error listing video details: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
 @app.route('/api/images', methods=['GET'])
 def list_images():
     try:
         start_time = datetime.now()
-        start = request.args.get('start')
-        end = request.args.get('end')
-        logger.info(f"Listing images with start={start}, end={end}")
         
-        start_date = datetime.fromisoformat(start) if start else None
-        end_date = datetime.fromisoformat(end) if end else None
+        # Process date parameters
+        start_date, end_date = process_date_params(request)
+        
+        logger.info(f"Listing images with start={start_date}, end={end_date}")
         
         media_files = media_index.get_files(directory="media", start=start_date, end=end_date)
         media_files = [f for f in media_files if f.endswith(('.jpg', '.png', '.jpeg'))]
@@ -162,12 +196,11 @@ def list_images():
 def list_audio():
     try:
         start_time = datetime.now()
-        start = request.args.get('start')
-        end = request.args.get('end')
-        logger.info(f"Listing audio with start={start}, end={end}")
         
-        start_date = datetime.fromisoformat(start) if start else None
-        end_date = datetime.fromisoformat(end) if end else None
+        # Process date parameters
+        start_date, end_date = process_date_params(request)
+        
+        logger.info(f"Listing audio with start={start_date}, end={end_date}")
         
         media_files = media_index.get_files(directory="audio", start=start_date, end=end_date)
         media_files = [f for f in media_files if f.endswith(('.mp3', '.opus', '.ogg', '.wav'))]
@@ -217,9 +250,11 @@ def internal_error(e):
 def data_size():
     try:
         start_time = datetime.now()
-        start = request.args.get('start')
-        end = request.args.get('end')
-        logger.info(f"Generating data size report with start={start}, end={end}")
+        
+        # Process date parameters
+        start_date, end_date = process_date_params(request)
+        
+        logger.info(f"Generating data size report with start={start_date}, end={end_date}")
         
         data = []
         for directory in [MEDIA_DIR, AUDIO_MEDIA_DIR]:
@@ -228,9 +263,9 @@ def data_size():
                     file_path = os.path.join(root, file)
                     mtime = datetime.fromtimestamp(os.path.getmtime(file_path))
                     
-                    if start and mtime < datetime.fromisoformat(start).replace(tzinfo=None):
+                    if start_date and mtime < start_date.replace(tzinfo=None):
                         continue
-                    if end and mtime > datetime.fromisoformat(end).replace(tzinfo=None):
+                    if end_date and mtime > end_date.replace(tzinfo=None):
                         continue
                         
                     size = os.path.getsize(file_path) / (1024 * 1024)
