@@ -12,6 +12,7 @@ import threading
 import re
 from file_cache import MediaFileIndex
 from file_cache import FileChangeHandler
+import pytz
 app = Flask(__name__)
 CORS(app)
 
@@ -65,6 +66,9 @@ def extract_timestamp_from_filename(filename):
         year, month, day, hour, minute, second = map(int, timestamp_match.groups())
         try:
             dt = datetime(year, month, day, hour, minute, second)
+            # Convert to UK timezone
+            uk_tz = pytz.timezone('Europe/London')
+            dt = uk_tz.localize(dt)
             return int(dt.timestamp() * 1000)  # Convert to milliseconds
         except ValueError:
             logger.error(f"Invalid date components in filename: {filename}")
