@@ -54,7 +54,13 @@ metadata_scanner_thread = threading.Thread(target=metadata_scanner_task, daemon=
 metadata_scanner_thread.start()
 
 def extract_timestamp_from_filename(filename):
+    # First try the standard pattern (used by videos)
     timestamp_match = re.match(r'(\d{4})(\d{2})(\d{2})_?(\d{2})(\d{2})(\d{2})', filename)
+    
+    # If that fails, try the pattern with recording_ prefix
+    if not timestamp_match:
+        timestamp_match = re.match(r'recording_(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})', filename)
+    
     if timestamp_match:
         year, month, day, hour, minute, second = map(int, timestamp_match.groups())
         try:
@@ -230,6 +236,9 @@ def list_audio_detailed():
             file_path = os.path.join(AUDIO_MEDIA_DIR, filename)
             file_size = os.path.getsize(file_path) if os.path.exists(file_path) else 0
             
+            # Get metadata if available
+            metadata = media_index.get_audio_details(filename)
+            
             # Create result object
             audio_info = {
                 "filename": filename,
@@ -241,6 +250,10 @@ def list_audio_detailed():
             epoch_millis = extract_timestamp_from_filename(filename)
             if epoch_millis:
                 audio_info["filename_as_epoch_millis"] = epoch_millis
+            
+            # Add metadata if available
+            if metadata:
+                audio_info["metadata"] = metadata
                 
             result.append(audio_info)
 

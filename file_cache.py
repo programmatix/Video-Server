@@ -16,7 +16,11 @@ def parse_media_date(filename, is_video=False, is_audio=False):
             date_str = filename[:15].replace('_', '')
         elif is_audio:
             # recording_20241209_064622.opus
-            date_str = filename[10:25].replace('_', '')
+            if filename.startswith('recording_'):
+                date_str = filename[10:25].replace('_', '')
+            else:
+                # Handle other audio filename formats if needed
+                date_str = filename[:15].replace('_', '')
         else:
             # 57-20250212071300-snapshot.jpg  
             # picture_filename %Y%m%d_%H%M%S-%q
@@ -32,6 +36,7 @@ class MediaFileIndex:
     def __init__(self):
         self.files = {}  # filename -> (datetime, type)
         self.video_metadata = {}  # filename -> metadata from JSON file
+        self.audio_metadata = {}  # filename -> metadata from JSON file
         self.lock = threading.Lock()
 
     def update_file(self, filename, directory):
@@ -47,39 +52,41 @@ class MediaFileIndex:
                 self.files[filename] = (date, directory)
                 logger.info(f"Added/updated file in index: {filename} with date {date}")
                 
-                # Check for associated JSON metadata for videos
-                if is_video and directory == "media":
-                    self.update_video_metadata(filename)
+                # Check for associated JSON metadata for videos and audio
+                if (is_video and directory == "media") or (is_audio and directory == "audio"):
+                    self.update_metadata(filename, directory)
 
-    def update_video_metadata(self, video_filename):
-        json_filename = os.path.splitext(video_filename)[0] + ".json"
+    def update_metadata(self, filename, directory):
+        json_filename = os.path.splitext(filename)[0] + ".json"
         
-        # Get the media directory path directly
-        if hasattr(self, 'media_dir'):
-            media_dir = self.media_dir
+        # Get the appropriate directory path
+        if directory == "media":
+            dir_path = self.media_dir
+            metadata_dict = self.video_metadata
         else:
-            media_dir = next((dir_path for name, dir_path in self.get_directories() if name == "media"), None)
+            dir_path = self.audio_dir
+            metadata_dict = self.audio_metadata
         
-        if not media_dir:
-            logger.error("Media directory not found")
+        if not dir_path:
+            logger.error(f"{directory} directory not found")
             return
             
-        json_path = os.path.join(media_dir, json_filename)
+        json_path = os.path.join(dir_path, json_filename)
         
         if os.path.exists(json_path):
             try:
                 with open(json_path, 'r') as f:
                     metadata = json.load(f)
-                self.video_metadata[video_filename] = metadata
-                logger.info(f"Loaded metadata for video: {video_filename}")
+                metadata_dict[filename] = metadata
+                logger.info(f"Loaded metadata for {directory} file: {filename}")
             except Exception as e:
-                logger.error(f"Error loading metadata for {video_filename}: {str(e)}")
-                if video_filename in self.video_metadata:
-                    del self.video_metadata[video_filename]
+                logger.error(f"Error loading metadata for {filename}: {str(e)}")
+                if filename in metadata_dict:
+                    del metadata_dict[filename]
         else:
             # Remove metadata if JSON file no longer exists
-            if video_filename in self.video_metadata:
-                del self.video_metadata[video_filename]
+            if filename in metadata_dict:
+                del metadata_dict[filename]
 
     def remove_file(self, filename):
         with self.lock:
@@ -87,10 +94,13 @@ class MediaFileIndex:
                 del self.files[filename]
                 logger.info(f"Removed file from index: {filename}")
             
-            # Remove metadata if it's a video file
+            # Remove metadata if it's a video or audio file
             if filename in self.video_metadata:
                 del self.video_metadata[filename]
-                logger.info(f"Removed metadata for: {filename}")
+                logger.info(f"Removed video metadata for: {filename}")
+            if filename in self.audio_metadata:
+                del self.audio_metadata[filename]
+                logger.info(f"Removed audio metadata for: {filename}")
 
     def get_directories(self):
         return []  # Will be implemented in the actual code
@@ -105,7 +115,8 @@ class MediaFileIndex:
         
         # Create temporary dict outside the lock
         temp_files = {}
-        temp_metadata = {}
+        temp_video_metadata = {}
+        temp_audio_metadata = {}
         
         for directory, dir_path in [("media", media_dir), ("audio", audio_dir)]:
             file_count = 0
@@ -125,8 +136,8 @@ class MediaFileIndex:
                 if date:
                     temp_files[entry.name] = (date, directory)
                     
-                    # Check for associated JSON metadata for videos
-                    if is_video and directory == "media":
+                    # Check for associated JSON metadata for videos and audio
+                    if (is_video and directory == "media") or (is_audio and directory == "audio"):
                         json_filename = os.path.splitext(entry.name)[0] + ".json"
                         json_path = os.path.join(dir_path, json_filename)
                         
@@ -134,7 +145,10 @@ class MediaFileIndex:
                             try:
                                 with open(json_path, 'r') as f:
                                     metadata = json.load(f)
-                                temp_metadata[entry.name] = metadata
+                                if is_video:
+                                    temp_video_metadata[entry.name] = metadata
+                                else:
+                                    temp_audio_metadata[entry.name] = metadata
                             except Exception as e:
                                 logger.error(f"Error loading metadata for {entry.name}: {str(e)}")
                                 
@@ -148,11 +162,14 @@ class MediaFileIndex:
             self.files.update(temp_files)
             
             self.video_metadata.clear()
-            self.video_metadata.update(temp_metadata)
+            self.video_metadata.update(temp_video_metadata)
+            
+            self.audio_metadata.clear()
+            self.audio_metadata.update(temp_audio_metadata)
 
         duration = datetime.now() - start_time
         logger.info(f"Finished building index in {duration.total_seconds():.2f}s. Total files indexed: {len(self.files)}")
-        logger.info(f"Loaded metadata for {len(self.video_metadata)} video files")
+        logger.info(f"Loaded metadata for {len(self.video_metadata)} video files and {len(self.audio_metadata)} audio files")
 
     def get_files(self, directory=None, start=None, end=None):
         with self.lock:
@@ -161,9 +178,14 @@ class MediaFileIndex:
                 if directory and file_dir != directory:
                     continue
                     
-                if start and date < start:
+                # Make date comparison timezone consistent
+                file_date = date
+                if file_date.tzinfo is not None:
+                    file_date = file_date.replace(tzinfo=None)
+                    
+                if start and file_date < start:
                     continue
-                if end and date > end:
+                if end and file_date > end:
                     continue
                     
                 files.append(filename)
@@ -174,6 +196,11 @@ class MediaFileIndex:
             metadata = self.video_metadata.get(video_filename, {})
             return metadata
 
+    def get_audio_details(self, audio_filename):
+        with self.lock:
+            metadata = self.audio_metadata.get(audio_filename, {})
+            return metadata
+
     def get_directories(self):
         return [
             ("media", self.media_dir),
@@ -181,21 +208,19 @@ class MediaFileIndex:
         ]
 
     def scan_for_missing_metadata(self):
-        """Scan for JSON metadata files that may have been added after video files were indexed"""
+        """Scan for JSON metadata files that may have been added after video/audio files were indexed"""
         logger.info("Scanning for newly-added JSON metadata files...")
         
-        if not hasattr(self, 'media_dir') or not self.media_dir:
-            logger.error("Media directory not set, cannot scan for missing metadata")
+        if not hasattr(self, 'media_dir') or not self.media_dir or not hasattr(self, 'audio_dir') or not self.audio_dir:
+            logger.error("Media or audio directory not set, cannot scan for missing metadata")
             return
         
         count = 0
         with self.lock:
             for filename, (date, directory) in self.files.items():
-                # Only check video files in the media directory
+                # Check video files in the media directory
                 if directory == "media" and filename.endswith(('.mp4', '.mkv', '.avi')):
-                    # If we don't already have metadata for this video
                     if filename not in self.video_metadata:
-                        # Check if a JSON file exists
                         json_filename = os.path.splitext(filename)[0] + ".json"
                         json_path = os.path.join(self.media_dir, json_filename)
                         
@@ -204,6 +229,23 @@ class MediaFileIndex:
                                 with open(json_path, 'r') as f:
                                     metadata = json.load(f)
                                 self.video_metadata[filename] = metadata
+                                count += 1
+                                if count % 100 == 0:
+                                    logger.info(f"Loaded {count} missing metadata files so far...")
+                            except Exception as e:
+                                logger.error(f"Error loading metadata for {filename}: {str(e)}")
+                
+                # Check audio files in the audio directory
+                elif directory == "audio" and filename.endswith(('.mp3', '.opus', '.ogg', '.wav')):
+                    if filename not in self.audio_metadata:
+                        json_filename = os.path.splitext(filename)[0] + ".json"
+                        json_path = os.path.join(self.audio_dir, json_filename)
+                        
+                        if os.path.exists(json_path):
+                            try:
+                                with open(json_path, 'r') as f:
+                                    metadata = json.load(f)
+                                self.audio_metadata[filename] = metadata
                                 count += 1
                                 if count % 100 == 0:
                                     logger.info(f"Loaded {count} missing metadata files so far...")
@@ -238,7 +280,7 @@ class FileChangeHandler(FileSystemEventHandler):
                     with self.index.lock:
                         if potential_video in self.index.files:
                             logger.info(f"Updating metadata for video {potential_video} from new JSON file")
-                            self.index.update_video_metadata(potential_video)
+                            self.index.update_metadata(potential_video, "media")
                             break
 
     def on_deleted(self, event):
@@ -280,5 +322,5 @@ class FileChangeHandler(FileSystemEventHandler):
                     with self.index.lock:
                         if potential_video in self.index.files:
                             logger.info(f"Updating metadata for video {potential_video} from modified JSON file")
-                            self.index.update_video_metadata(potential_video)
+                            self.index.update_metadata(potential_video, "media")
                             break
