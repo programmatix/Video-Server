@@ -109,16 +109,26 @@ class MediaFileIndex:
         start_time = datetime.now()
         logger.info("Starting to build media file index...")
         
-        # Store directories for later use
-        self.media_dir = media_dir
-        self.audio_dir = audio_dir
+        # Store directories for later use (when available)
+        self.media_dir = media_dir if os.path.isdir(media_dir) else None
+        if not self.media_dir:
+            logger.warning(f"Media directory not found: {media_dir}. Index will start empty.")
+        self.audio_dir = audio_dir if os.path.isdir(audio_dir) else None
+        if not self.audio_dir:
+            logger.warning(f"Audio directory not found: {audio_dir}. Index will start empty.")
         
         # Create temporary dict outside the lock
         temp_files = {}
         temp_video_metadata = {}
         temp_audio_metadata = {}
         
-        for directory, dir_path in [("media", media_dir), ("audio", audio_dir)]:
+        directories_to_scan = []
+        if self.media_dir:
+            directories_to_scan.append(("media", self.media_dir))
+        if self.audio_dir:
+            directories_to_scan.append(("audio", self.audio_dir))
+
+        for directory, dir_path in directories_to_scan:
             file_count = 0
             logger.info(f"Scanning {directory} directory: {dir_path}")
             
@@ -211,8 +221,10 @@ class MediaFileIndex:
         """Scan for JSON metadata files that may have been added after video/audio files were indexed"""
         logger.info("Scanning for newly-added JSON metadata files...")
         
-        if not hasattr(self, 'media_dir') or not self.media_dir or not hasattr(self, 'audio_dir') or not self.audio_dir:
-            logger.error("Media or audio directory not set, cannot scan for missing metadata")
+        has_media_dir = bool(getattr(self, 'media_dir', None))
+        has_audio_dir = bool(getattr(self, 'audio_dir', None))
+        if not has_media_dir and not has_audio_dir:
+            logger.error("Media and audio directories not set, cannot scan for missing metadata")
             return
         
         count = 0
@@ -220,6 +232,8 @@ class MediaFileIndex:
             for filename, (date, directory) in self.files.items():
                 # Check video files in the media directory
                 if directory == "media" and filename.endswith(('.mp4', '.mkv', '.avi')):
+                    if not self.media_dir:
+                        continue
                     if filename not in self.video_metadata:
                         json_filename = os.path.splitext(filename)[0] + ".json"
                         json_path = os.path.join(self.media_dir, json_filename)
@@ -237,6 +251,8 @@ class MediaFileIndex:
                 
                 # Check audio files in the audio directory
                 elif directory == "audio" and filename.endswith(('.mp3', '.opus', '.ogg', '.wav')):
+                    if not self.audio_dir:
+                        continue
                     if filename not in self.audio_metadata:
                         json_filename = os.path.splitext(filename)[0] + ".json"
                         json_path = os.path.join(self.audio_dir, json_filename)

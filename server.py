@@ -23,21 +23,37 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Directory where media files are stored
-MEDIA_DIR = "/home/graham/motion"
-AUDIO_MEDIA_DIR = "/home/graham/audio"
+MEDIA_DIR = "/mnt/bigdisk3/motion"
+AUDIO_MEDIA_DIR = "/mnt/bigdisk3/audio"
 
 
 # Initialize index and build it
 media_index = MediaFileIndex()
 media_index.build_index(MEDIA_DIR, AUDIO_MEDIA_DIR)
 
-# Set up file watchers
+# Set up file watchers (if the directories exist)
+def schedule_directory_watch(observer, handler, directory_path, directory_name):
+    if not os.path.isdir(directory_path):
+        logger.warning(f"{directory_name.capitalize()} directory {directory_path} does not exist. File watcher disabled.")
+        return False
+    try:
+        observer.schedule(handler, directory_path, recursive=False)
+        logger.info(f"Watching {directory_name} directory for changes: {directory_path}")
+        return True
+    except FileNotFoundError:
+        logger.warning(f"{directory_name.capitalize()} directory {directory_path} disappeared before watcher could start.")
+        return False
+
 observer = Observer()
 media_handler = FileChangeHandler(media_index, "media")
 audio_handler = FileChangeHandler(media_index, "audio")
-observer.schedule(media_handler, MEDIA_DIR, recursive=False)
-observer.schedule(audio_handler, AUDIO_MEDIA_DIR, recursive=False)
-observer.start()
+media_watch_active = schedule_directory_watch(observer, media_handler, MEDIA_DIR, "media")
+audio_watch_active = schedule_directory_watch(observer, audio_handler, AUDIO_MEDIA_DIR, "audio")
+
+if media_watch_active or audio_watch_active:
+    observer.start()
+else:
+    logger.warning("No media directories available; file change watchers not started.")
 
 # Set up a background task to periodically scan for new JSON metadata
 def metadata_scanner_task():
