@@ -3,6 +3,7 @@ from datetime import datetime
 import os
 import logging
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from watchdog.events import FileSystemEventHandler
 
 
@@ -128,43 +129,72 @@ class MediaFileIndex:
         if self.audio_dir:
             directories_to_scan.append(("audio", self.audio_dir))
 
-        for directory, dir_path in directories_to_scan:
-            file_count = 0
-            logger.info(f"Scanning {directory} directory: {dir_path}")
+        worker_count = max(1, min(32, os.cpu_count() or 4))
+
+        def scan_directory(directory, dir_path):
+            directory_files = {}
+            directory_video_metadata = {}
+            directory_audio_metadata = {}
+            entries = []
             
-            for entry in os.scandir(dir_path):
-                if file_count % 10000 == 0:
-                    logger.info(f"Processed {file_count} files in {directory} directory...")
-                    
-                if not entry.name.endswith(('.mp4', '.mkv', '.avi', '.mp3', '.jpg', '.png', '.jpeg', '.opus', '.ogg', '.wav')):
-                    continue
-                    
-                is_video = entry.name.endswith(('.mp4', '.mkv', '.avi'))
-                is_audio = entry.name.endswith(('.mp3', '.opus', '.ogg', '.wav'))
-                date = parse_media_date(entry.name, is_video=is_video, is_audio=is_audio)
+            try:
+                with os.scandir(dir_path) as it:
+                    for entry in it:
+                        entries.append((entry.name, entry.path))
+            except Exception as e:
+                logger.error(f"Error scanning {dir_path}: {str(e)}")
+                return directory_files, directory_video_metadata, directory_audio_metadata
+            
+            logger.info(f"Scanning {directory} directory with {len(entries)} entries using {worker_count} workers...")
+            valid_extensions = ('.mp4', '.mkv', '.avi', '.mp3', '.jpg', '.png', '.jpeg', '.opus', '.ogg', '.wav')
+            
+            def process_entry(item):
+                filename, file_path = item
+                if not filename.endswith(valid_extensions):
+                    return None
                 
-                if date:
-                    temp_files[entry.name] = (date, directory)
-                    
-                    # Check for associated JSON metadata for videos and audio
-                    if (is_video and directory == "media") or (is_audio and directory == "audio"):
-                        json_filename = os.path.splitext(entry.name)[0] + ".json"
-                        json_path = os.path.join(dir_path, json_filename)
-                        
-                        if os.path.exists(json_path):
-                            try:
-                                with open(json_path, 'r') as f:
-                                    metadata = json.load(f)
-                                if is_video:
-                                    temp_video_metadata[entry.name] = metadata
-                                else:
-                                    temp_audio_metadata[entry.name] = metadata
-                            except Exception as e:
-                                logger.error(f"Error loading metadata for {entry.name}: {str(e)}")
-                                
-                file_count += 1
-                        
-            logger.info(f"Completed scanning {directory} directory. Processed {file_count} files.")
+                is_video = filename.endswith(('.mp4', '.mkv', '.avi'))
+                is_audio = filename.endswith(('.mp3', '.opus', '.ogg', '.wav'))
+                date = parse_media_date(filename, is_video=is_video, is_audio=is_audio)
+                if not date:
+                    return None
+                
+                metadata_type = None
+                metadata = None
+                if (is_video and directory == "media") or (is_audio and directory == "audio"):
+                    json_filename = os.path.splitext(filename)[0] + ".json"
+                    json_path = os.path.join(dir_path, json_filename)
+                    if os.path.exists(json_path):
+                        try:
+                            with open(json_path, 'r') as f:
+                                metadata = json.load(f)
+                            metadata_type = "video" if is_video else "audio"
+                        except Exception as e:
+                            logger.error(f"Error loading metadata for {filename}: {str(e)}")
+                            metadata = None
+                return filename, (date, directory), metadata_type, metadata
+            
+            with ThreadPoolExecutor(max_workers=worker_count) as executor:
+                for idx, result in enumerate(executor.map(process_entry, entries, chunksize=256), start=1):
+                    if idx % 10000 == 0:
+                        logger.info(f"Processed {idx} files in {directory} directory...")
+                    if not result:
+                        continue
+                    filename, file_record, metadata_type, metadata = result
+                    directory_files[filename] = file_record
+                    if metadata_type == "video" and metadata is not None:
+                        directory_video_metadata[filename] = metadata
+                    elif metadata_type == "audio" and metadata is not None:
+                        directory_audio_metadata[filename] = metadata
+            
+            logger.info(f"Completed scanning {directory} directory. Processed {len(entries)} files.")
+            return directory_files, directory_video_metadata, directory_audio_metadata
+
+        for directory, dir_path in directories_to_scan:
+            dir_files, dir_video_metadata, dir_audio_metadata = scan_directory(directory, dir_path)
+            temp_files.update(dir_files)
+            temp_video_metadata.update(dir_video_metadata)
+            temp_audio_metadata.update(dir_audio_metadata)
 
         # Single lock to update the main files dict
         with self.lock:
