@@ -5,33 +5,27 @@ import logging
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from watchdog.events import FileSystemEventHandler
+import re
 
 
 logger = logging.getLogger(__name__)
 
 def parse_media_date(filename, is_video=False, is_audio=False):
-    try:
-        if is_video:
-            # movie_filename %Y%m%d_%H%M%S
-            # 20250212_064159.mkv
-            date_str = filename[:15].replace('_', '')
-        elif is_audio:
-            # recording_20241209_064622.opus
-            if filename.startswith('recording_'):
-                date_str = filename[10:25].replace('_', '')
-            else:
-                # Handle other audio filename formats if needed
-                date_str = filename[:15].replace('_', '')
-        else:
-            # 57-20250212071300-snapshot.jpg  
-            # picture_filename %Y%m%d_%H%M%S-%q
-            date_str = filename.split('-')[1][:14]
-        
-        # Create a naive datetime (no timezone)
-        dt = datetime.strptime(date_str, '%Y%m%d%H%M%S')
-        return dt
-    except (IndexError, ValueError):
-        return None
+    """
+    Extract a datetime from common media filename formats.
+    Many cameras encode timestamps as a 14 digit block (YYYYMMDDHHMMSS)
+    with various prefixes. We strip underscores (filenames like
+    20250212_064159.mkv) and search for a 14 digit sequence so that we
+    also handle names such as 0-01-20240909173304.mkv or recording_20241209_064622.opus.
+    """
+    cleaned = filename.replace('_', '')
+    matches = re.findall(r'(\d{14})', cleaned)
+    for date_str in matches:
+        try:
+            return datetime.strptime(date_str, '%Y%m%d%H%M%S')
+        except ValueError:
+            continue
+    return None
 
 class MediaFileIndex:
     def __init__(self):
@@ -129,7 +123,7 @@ class MediaFileIndex:
         if self.audio_dir:
             directories_to_scan.append(("audio", self.audio_dir))
 
-        worker_count = max(1, min(32, os.cpu_count() or 4))
+        worker_count = max(1, min(32, os.cpu_count() or 8))
 
         def scan_directory(directory, dir_path):
             directory_files = {}
